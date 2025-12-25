@@ -1,7 +1,186 @@
 -----------------------------------------------------------
+-- REQUEST QUEUE & RATE LIMITING
+-----------------------------------------------------------
+local requestQueue = {}
+local isProcessingQueue = false
+local lastRequestTime = 0
+local requestsThisMinute = 0
+local lastMinuteReset = GetGameTimer()
+local pendingRequests = {}  -- Track pending requests per player
+
+-- Rate limit config (adjust based on your API tier)
+local RATE_LIMIT = {
+    requestsPerMinute = 50,      -- Anthropic free tier is ~60/min
+    minDelayMs = 200,            -- Minimum delay between requests
+    maxConcurrent = 5,           -- Max concurrent requests
+    requestTimeoutMs = 30000     -- 30 second timeout
+}
+
+local currentConcurrent = 0
+
+function QueueAIRequest(playerId, conversation, playerMessage)
+    -- Check if player already has a pending request
+    if pendingRequests[playerId] then
+        TriggerClientEvent('ai-npcs:client:receiveMessage', playerId,
+            "*holds up a finger* Hold on, I'm still thinking...", conversation.npc.id)
+        return
+    end
+
+    -- Add to queue
+    table.insert(requestQueue, {
+        playerId = playerId,
+        conversation = conversation,
+        playerMessage = playerMessage,
+        queuedAt = GetGameTimer()
+    })
+
+    pendingRequests[playerId] = true
+
+    -- Start processing if not already
+    if not isProcessingQueue then
+        ProcessRequestQueue()
+    end
+end
+
+function ProcessRequestQueue()
+    if #requestQueue == 0 then
+        isProcessingQueue = false
+        return
+    end
+
+    isProcessingQueue = true
+    local currentTime = GetGameTimer()
+
+    -- Reset rate limit counter every minute
+    if currentTime - lastMinuteReset > 60000 then
+        requestsThisMinute = 0
+        lastMinuteReset = currentTime
+    end
+
+    -- Check rate limits
+    if requestsThisMinute >= RATE_LIMIT.requestsPerMinute then
+        -- Wait until next minute
+        local waitTime = 60000 - (currentTime - lastMinuteReset) + 100
+        if Config.Debug.enabled then
+            print(("[AI NPCs] Rate limit reached, waiting %dms"):format(waitTime))
+        end
+        SetTimeout(waitTime, ProcessRequestQueue)
+        return
+    end
+
+    -- Check concurrent limit
+    if currentConcurrent >= RATE_LIMIT.maxConcurrent then
+        SetTimeout(500, ProcessRequestQueue)
+        return
+    end
+
+    -- Check minimum delay
+    local timeSinceLastRequest = currentTime - lastRequestTime
+    if timeSinceLastRequest < RATE_LIMIT.minDelayMs then
+        SetTimeout(RATE_LIMIT.minDelayMs - timeSinceLastRequest, ProcessRequestQueue)
+        return
+    end
+
+    -- Get next request
+    local request = table.remove(requestQueue, 1)
+    if not request then
+        isProcessingQueue = false
+        return
+    end
+
+    -- Check if request is too old (player might have left)
+    if currentTime - request.queuedAt > 60000 then
+        pendingRequests[request.playerId] = nil
+        ProcessRequestQueue()
+        return
+    end
+
+    -- Process the request
+    lastRequestTime = currentTime
+    requestsThisMinute = requestsThisMinute + 1
+    currentConcurrent = currentConcurrent + 1
+
+    GenerateAIResponseInternal(request.playerId, request.conversation, request.playerMessage, function()
+        currentConcurrent = currentConcurrent - 1
+        pendingRequests[request.playerId] = nil
+        -- Process next request
+        SetTimeout(RATE_LIMIT.minDelayMs, ProcessRequestQueue)
+    end)
+end
+
+-----------------------------------------------------------
+-- FALLBACK DIALOGUE SYSTEM
+-----------------------------------------------------------
+local FallbackDialogue = {
+    generic = {
+        "*scratches head* What were we talking about again?",
+        "*looks around nervously* I... forgot what I was saying.",
+        "Hmm? Sorry, got distracted for a second there.",
+        "*clears throat* Anyway, what did you want to know?",
+        "*shifts weight* My mind wandered for a bit there...",
+    },
+    criminal = {
+        "*glances around* Can't talk right now, too many eyes.",
+        "*lowers voice* Not a good time. Come back later.",
+        "I don't know nothing about nothing, capisce?",
+        "*shrugs* Street's been quiet. Nothing to report.",
+        "*spits* Ask someone else, I got my own problems.",
+    },
+    legitimate = {
+        "I'm sorry, I'm quite busy at the moment.",
+        "*checks phone* I have another appointment, can we continue later?",
+        "Is there something specific I can help you with?",
+        "*smiles politely* Why don't we pick this up another time?",
+        "I'm not sure I understand what you're asking.",
+    },
+    service = {
+        "How can I help you today?",
+        "*nods* What can I get for you?",
+        "Need anything else?",
+        "*wipes counter* Just let me know if you need something.",
+        "Anything on your mind?",
+    },
+    api_down = {
+        "*holds head* Sorry, not feeling well right now. Come back later.",
+        "*waves dismissively* Bad timing, friend. Maybe later.",
+        "*turns away* I've got nothing for you today.",
+        "*sighs* Too much on my mind right now. Another day.",
+        "*looks tired* Not now. I need a break.",
+    }
+}
+
+function GetFallbackResponse(npc, reason)
+    local category = "generic"
+
+    -- Determine category based on NPC trust category
+    if npc.trustCategory then
+        if npc.trustCategory == "criminal" or npc.trustCategory == "gang" then
+            category = "criminal"
+        elseif npc.trustCategory == "professional" or npc.trustCategory == "legitimate" then
+            category = "legitimate"
+        elseif npc.trustCategory == "service" then
+            category = "service"
+        end
+    end
+
+    -- Use API down messages for actual failures
+    if reason == "api_error" or reason == "timeout" then
+        category = "api_down"
+    end
+
+    local responses = FallbackDialogue[category] or FallbackDialogue.generic
+    return responses[math.random(#responses)]
+end
+
+-----------------------------------------------------------
 -- AI Response Generation with Full Context
 -----------------------------------------------------------
 function GenerateAIResponse(playerId, conversation, playerMessage)
+    -- Use the queue system instead of direct call
+    QueueAIRequest(playerId, conversation, playerMessage)
+end
+
+function GenerateAIResponseInternal(playerId, conversation, playerMessage, onComplete)
     local npc = conversation.npc
     local playerContext = conversation.playerContext
 
@@ -54,8 +233,28 @@ function GenerateAIResponse(playerId, conversation, playerMessage)
         }
     end
 
+    -- Timeout tracking
+    local requestId = GetGameTimer()
+    local hasResponded = false
+    local timeoutTriggered = false
+
+    -- Set up timeout handler
+    SetTimeout(RATE_LIMIT.requestTimeoutMs, function()
+        if not hasResponded then
+            timeoutTriggered = true
+            print(("[AI NPCs] Request timeout for player %s"):format(playerId))
+            local fallback = GetFallbackResponse(npc, "timeout")
+            TriggerClientEvent('ai-npcs:client:receiveMessage', playerId, fallback, npc.id)
+            if onComplete then onComplete() end
+        end
+    end)
+
     -- Make API request
     PerformHttpRequest(Config.AI.apiUrl, function(statusCode, response, respHeaders)
+        -- Ignore if timeout already triggered
+        if timeoutTriggered then return end
+        hasResponded = true
+
         if statusCode == 200 then
             local success, data = pcall(json.decode, response)
             local aiResponse = nil
@@ -92,15 +291,22 @@ function GenerateAIResponse(playerId, conversation, playerMessage)
             else
                 print("[AI NPCs] Failed to parse AI response")
                 print("[AI NPCs] Raw response: " .. tostring(response))
-                TriggerClientEvent('ai-npcs:client:receiveMessage', playerId,
-                    "*mutters* Sorry, lost my train of thought...", npc.id)
+                local fallback = GetFallbackResponse(npc, "parse_error")
+                TriggerClientEvent('ai-npcs:client:receiveMessage', playerId, fallback, npc.id)
             end
+        elseif statusCode == 429 then
+            -- Rate limited by API
+            print("[AI NPCs] API rate limit hit (429)")
+            local fallback = GetFallbackResponse(npc, "api_error")
+            TriggerClientEvent('ai-npcs:client:receiveMessage', playerId, fallback, npc.id)
         else
             print(("[AI NPCs] AI API request failed with status: %s"):format(statusCode))
             print("[AI NPCs] Response: " .. tostring(response))
-            TriggerClientEvent('ai-npcs:client:receiveMessage', playerId,
-                "*looks distracted* Give me a second...", npc.id)
+            local fallback = GetFallbackResponse(npc, "api_error")
+            TriggerClientEvent('ai-npcs:client:receiveMessage', playerId, fallback, npc.id)
         end
+
+        if onComplete then onComplete() end
     end, 'POST', json.encode(requestData), headers)
 end
 

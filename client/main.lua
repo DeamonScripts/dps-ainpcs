@@ -195,12 +195,14 @@ function ScheduleNPCSpawn(npcData)
 end
 
 -----------------------------------------------------------
--- MOVEMENT SYSTEM
+-- MOVEMENT SYSTEM (with dynamic sleep for optimization)
 -----------------------------------------------------------
 function StartMovementSystem()
     CreateThread(function()
         while true do
-            Wait(5000) -- Check every 5 seconds
+            local playerCoords = GetEntityCoords(PlayerPedId())
+            local nearestDistance = 999999.0
+            local sleepTime = 5000  -- Default: check every 5 seconds
 
             for npcId, npcInfo in pairs(spawnedNPCs) do
                 local npcData = npcInfo.data
@@ -210,19 +212,42 @@ function StartMovementSystem()
                     goto continue
                 end
 
+                -- Calculate distance for dynamic sleep
+                local npcCoords = GetEntityCoords(entity)
+                local distance = #(playerCoords - npcCoords)
+                if distance < nearestDistance then
+                    nearestDistance = distance
+                end
+
                 -- Check if NPC should still be available
                 if not IsNPCAvailable(npcData) then
                     DespawnNPC(npcId)
                     goto continue
                 end
 
-                -- Handle movement patterns
-                if npcData.movement then
+                -- Handle movement patterns (only if player is within range)
+                if npcData.movement and distance < 100.0 then
                     HandleNPCMovement(npcId, npcInfo)
                 end
 
                 ::continue::
             end
+
+            -- Dynamic sleep based on nearest NPC distance
+            -- Closer = more frequent updates for smoother movement
+            if nearestDistance < 15.0 then
+                sleepTime = 500    -- Very close: 0.5s updates
+            elseif nearestDistance < 30.0 then
+                sleepTime = 1000   -- Close: 1s updates
+            elseif nearestDistance < 50.0 then
+                sleepTime = 2000   -- Medium: 2s updates
+            elseif nearestDistance < 100.0 then
+                sleepTime = 3000   -- Far: 3s updates
+            else
+                sleepTime = 5000   -- Very far: 5s updates
+            end
+
+            Wait(sleepTime)
         end
     end)
 end
@@ -233,7 +258,10 @@ function HandleNPCMovement(npcId, npcInfo)
     local pattern = npcData.movement.pattern
     local currentTime = GetGameTimer()
 
-    -- Don't move if in conversation
+    -- Don't move if in conversation (either via global check or local flag)
+    if npcInfo.inConversation then
+        return
+    end
     if activeConversation and activeConversation.npcId == npcId then
         return
     end
@@ -435,12 +463,27 @@ function StartConversation(npcId)
     if DoesEntityExist(npcInfo.entity) then
         ClearPedTasksImmediately(npcInfo.entity)
         npcInfo.isMoving = false
+        npcInfo.inConversation = true
 
         -- Face the player
         local playerCoords = GetEntityCoords(PlayerPedId())
         local npcCoords = GetEntityCoords(npcInfo.entity)
         local heading = GetHeadingFromVector_2d(playerCoords.x - npcCoords.x, playerCoords.y - npcCoords.y)
         SetEntityHeading(npcInfo.entity, heading)
+
+        -- Freeze NPC in place during conversation
+        FreezeEntityPosition(npcInfo.entity, true)
+
+        -- Play idle talking animation
+        RequestAnimDict("mp_facial")
+        local timeout = 0
+        while not HasAnimDictLoaded("mp_facial") and timeout < 1000 do
+            Wait(10)
+            timeout = timeout + 10
+        end
+        if HasAnimDictLoaded("mp_facial") then
+            TaskPlayAnim(npcInfo.entity, "mp_facial", "mic_chatter", 3.0, -3.0, -1, 49, 0, false, false, false)
+        end
     end
 
     activeConversation = {
@@ -469,6 +512,20 @@ end
 
 function EndConversation(reason)
     if not activeConversation then return end
+
+    -- Restore NPC to normal state
+    local npcInfo = spawnedNPCs[activeConversation.npcId]
+    if npcInfo and DoesEntityExist(npcInfo.entity) then
+        -- Clear animation
+        ClearPedTasks(npcInfo.entity)
+        npcInfo.inConversation = false
+
+        -- Unfreeze if NPC has movement pattern
+        if npcInfo.data.movement and npcInfo.data.movement.pattern ~= "stationary" then
+            FreezeEntityPosition(npcInfo.entity, false)
+            npcInfo.lastMoveTime = GetGameTimer()  -- Reset move timer
+        end
+    end
 
     SetNuiFocus(false, false)
     SendNUIMessage({
