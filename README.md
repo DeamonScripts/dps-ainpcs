@@ -62,6 +62,7 @@ Trust is earned through:
    - qb-core
    - ox_lib
    - ox_target
+   - Anthropic API key (https://console.anthropic.com/) or OpenAI API key
 
 2. **Copy Config**:
    ```bash
