@@ -658,3 +658,225 @@ function CleanAudioCache()
         print(("[AI NPCs] Cleaned %d cached audio files"):format(count))
     end
 end
+
+-----------------------------------------------------------
+-- ADMIN COMMANDS (Token Bucket Management)
+-----------------------------------------------------------
+local ADMIN_JOBS = {
+    ['admin'] = true,
+    ['god'] = true,
+    ['developer'] = true,
+}
+
+local function IsAdmin(source)
+    local Player = QBCore.Functions.GetPlayer(source)
+    if not Player then return false end
+
+    local job = Player.PlayerData.job.name
+    local group = QBCore.Functions.GetPermission(source)
+
+    -- Check job-based admin
+    if ADMIN_JOBS[job] then return true end
+
+    -- Check permission group (ace permissions)
+    if group == 'admin' or group == 'god' then return true end
+
+    return false
+end
+
+-- /ainpc tokens [player_id] - Check a player's token bucket status
+RegisterCommand('ainpc', function(source, args, rawCommand)
+    if source > 0 and not IsAdmin(source) then
+        TriggerClientEvent('ox_lib:notify', source, {
+            title = 'Access Denied',
+            description = 'Admin only command',
+            type = 'error'
+        })
+        return
+    end
+
+    local subcommand = args[1]
+
+    if subcommand == 'tokens' then
+        -- Check token status
+        local targetId = tonumber(args[2])
+        if not targetId then
+            -- Show all players with buckets
+            local output = "^3[AI NPCs] Token Bucket Status:^7\n"
+            local count = 0
+            for playerId, bucket in pairs(playerBuckets) do
+                local Player = QBCore.Functions.GetPlayer(playerId)
+                local name = Player and Player.PlayerData.charinfo.firstname or "Unknown"
+                local tokens = GetTokensRemaining(playerId)
+                local nextToken = math.ceil(GetTimeUntilNextToken(playerId) / 1000)
+                output = output .. ("  ID %d (%s): %d/%d tokens, next in %ds\n"):format(
+                    playerId, name, tokens, TOKEN_BUCKET.maxTokens, nextToken
+                )
+                count = count + 1
+            end
+            if count == 0 then
+                output = output .. "  No active buckets\n"
+            end
+            print(output)
+
+            if source > 0 then
+                TriggerClientEvent('ox_lib:notify', source, {
+                    title = 'Token Status',
+                    description = count .. ' active player buckets (see console)',
+                    type = 'info'
+                })
+            end
+        else
+            -- Check specific player
+            local tokens = GetTokensRemaining(targetId)
+            local nextToken = math.ceil(GetTimeUntilNextToken(targetId) / 1000)
+            local pending = pendingRequests[targetId] and "Yes" or "No"
+
+            local msg = ("Player %d: %d/%d tokens, next in %ds, pending: %s"):format(
+                targetId, tokens, TOKEN_BUCKET.maxTokens, nextToken, pending
+            )
+            print("[AI NPCs] " .. msg)
+
+            if source > 0 then
+                TriggerClientEvent('ox_lib:notify', source, {
+                    title = 'Token Status',
+                    description = msg,
+                    type = 'info'
+                })
+            end
+        end
+
+    elseif subcommand == 'refill' then
+        -- Refill a player's tokens
+        local targetId = tonumber(args[2])
+        if not targetId then
+            if source > 0 then
+                TriggerClientEvent('ox_lib:notify', source, {
+                    title = 'Usage',
+                    description = '/ainpc refill [player_id]',
+                    type = 'error'
+                })
+            else
+                print("[AI NPCs] Usage: /ainpc refill [player_id]")
+            end
+            return
+        end
+
+        -- Reset bucket to full
+        playerBuckets[targetId] = {
+            tokens = TOKEN_BUCKET.maxTokens,
+            lastRefill = GetGameTimer()
+        }
+
+        local msg = ("Refilled tokens for player %d to %d"):format(targetId, TOKEN_BUCKET.maxTokens)
+        print("[AI NPCs] " .. msg)
+
+        if source > 0 then
+            TriggerClientEvent('ox_lib:notify', source, {
+                title = 'Tokens Refilled',
+                description = msg,
+                type = 'success'
+            })
+        end
+
+        -- Notify target player
+        TriggerClientEvent('ox_lib:notify', targetId, {
+            title = 'AI NPCs',
+            description = 'Your conversation limit has been reset',
+            type = 'info'
+        })
+
+    elseif subcommand == 'refillall' then
+        -- Refill all players' tokens
+        local count = 0
+        for playerId, _ in pairs(playerBuckets) do
+            playerBuckets[playerId] = {
+                tokens = TOKEN_BUCKET.maxTokens,
+                lastRefill = GetGameTimer()
+            }
+            count = count + 1
+        end
+
+        local msg = ("Refilled tokens for %d players"):format(count)
+        print("[AI NPCs] " .. msg)
+
+        if source > 0 then
+            TriggerClientEvent('ox_lib:notify', source, {
+                title = 'All Tokens Refilled',
+                description = msg,
+                type = 'success'
+            })
+        end
+
+    elseif subcommand == 'queue' then
+        -- Show request queue status
+        local output = ("^3[AI NPCs] Queue Status:^7\n")
+        output = output .. ("  Queued requests: %d\n"):format(#requestQueue)
+        output = output .. ("  Concurrent: %d/%d\n"):format(currentConcurrent, GLOBAL_STAGGER.maxConcurrent)
+        output = output .. ("  Processing: %s\n"):format(isProcessingQueue and "Yes" or "No")
+
+        for i, req in ipairs(requestQueue) do
+            if i > 5 then
+                output = output .. ("  ... and %d more\n"):format(#requestQueue - 5)
+                break
+            end
+            local age = math.floor((GetGameTimer() - req.queuedAt) / 1000)
+            output = output .. ("  [%d] Player %d, queued %ds ago\n"):format(i, req.playerId, age)
+        end
+        print(output)
+
+        if source > 0 then
+            TriggerClientEvent('ox_lib:notify', source, {
+                title = 'Queue Status',
+                description = ('%d queued, %d/%d concurrent'):format(
+                    #requestQueue, currentConcurrent, GLOBAL_STAGGER.maxConcurrent
+                ),
+                type = 'info'
+            })
+        end
+
+    elseif subcommand == 'debug' then
+        -- Toggle debug mode
+        Config.Debug.enabled = not Config.Debug.enabled
+        local state = Config.Debug.enabled and "ENABLED" or "DISABLED"
+        print(("[AI NPCs] Debug mode %s"):format(state))
+
+        if source > 0 then
+            TriggerClientEvent('ox_lib:notify', source, {
+                title = 'Debug Mode',
+                description = state,
+                type = Config.Debug.enabled and 'success' or 'info'
+            })
+        end
+
+    else
+        -- Show help
+        local help = [[
+^3[AI NPCs] Admin Commands:^7
+  /ainpc tokens [id]    - Check token bucket status (all or specific player)
+  /ainpc refill <id>    - Refill a player's tokens to max
+  /ainpc refillall      - Refill all players' tokens
+  /ainpc queue          - Show request queue status
+  /ainpc debug          - Toggle debug mode
+]]
+        print(help)
+
+        if source > 0 then
+            TriggerClientEvent('ox_lib:notify', source, {
+                title = 'AI NPC Commands',
+                description = 'See console (F8) for command list',
+                type = 'info'
+            })
+        end
+    end
+end, false)
+
+-- Export for external admin tools
+exports('GetPlayerTokens', GetTokensRemaining)
+exports('RefillPlayerTokens', function(playerId)
+    playerBuckets[playerId] = {
+        tokens = TOKEN_BUCKET.maxTokens,
+        lastRefill = GetGameTimer()
+    }
+    return true
+end)
