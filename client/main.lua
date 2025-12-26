@@ -234,17 +234,16 @@ function StartMovementSystem()
             end
 
             -- Dynamic sleep based on nearest NPC distance
-            -- Closer = more frequent updates for smoother movement
-            if nearestDistance < 15.0 then
-                sleepTime = 500    -- Very close: 0.5s updates
+            -- Optimized thresholds: responsive when close, efficient when far
+            -- Note: 0ms is avoided to prevent frame stutter/client freezes
+            if nearestDistance < 5.0 then
+                sleepTime = 100    -- Very close (<5m): 100ms - near-instant response
+            elseif nearestDistance < 15.0 then
+                sleepTime = 500    -- Close: 0.5s updates
             elseif nearestDistance < 30.0 then
-                sleepTime = 1000   -- Close: 1s updates
-            elseif nearestDistance < 50.0 then
-                sleepTime = 2000   -- Medium: 2s updates
-            elseif nearestDistance < 100.0 then
-                sleepTime = 3000   -- Far: 3s updates
+                sleepTime = 1000   -- Medium-close: 1s updates
             else
-                sleepTime = 5000   -- Very far: 5s updates
+                sleepTime = 2000   -- Far (>30m): 2s updates - matches >50m spec
             end
 
             Wait(sleepTime)

@@ -1,29 +1,111 @@
 -----------------------------------------------------------
--- REQUEST QUEUE & RATE LIMITING
+-- TOKEN BUCKET RATE LIMITING (Per-Player)
+-- Algorithm: Each player has a bucket with max 5 tokens
+-- Tokens refill at 1 per 12 seconds (5 per minute)
+-- Each AI request consumes 1 token
 -----------------------------------------------------------
+local playerBuckets = {}  -- { [playerId] = { tokens, lastRefill } }
 local requestQueue = {}
 local isProcessingQueue = false
 local lastRequestTime = 0
-local requestsThisMinute = 0
-local lastMinuteReset = GetGameTimer()
 local pendingRequests = {}  -- Track pending requests per player
-
--- Rate limit config (adjust based on your API tier)
-local RATE_LIMIT = {
-    requestsPerMinute = 50,      -- Anthropic free tier is ~60/min
-    minDelayMs = 200,            -- Minimum delay between requests
-    maxConcurrent = 5,           -- Max concurrent requests
-    requestTimeoutMs = 30000     -- 30 second timeout
-}
-
 local currentConcurrent = 0
 
+-- Token Bucket configuration (per-player limits)
+local TOKEN_BUCKET = {
+    maxTokens = 5,              -- Max tokens per player (burst capacity)
+    refillRate = 5,             -- Tokens per minute
+    refillIntervalMs = 12000,   -- 1 token every 12 seconds (60000/5)
+}
+
+-- Global stagger configuration (prevents API burst)
+local GLOBAL_STAGGER = {
+    minDelayMs = 300,           -- Minimum ms between any API calls
+    maxConcurrent = 5,          -- Max concurrent API requests
+    requestTimeoutMs = 30000    -- 30 second timeout per request
+}
+
+-----------------------------------------------------------
+-- Token Bucket Management
+-----------------------------------------------------------
+function GetPlayerBucket(playerId)
+    local currentTime = GetGameTimer()
+
+    if not playerBuckets[playerId] then
+        -- Initialize new bucket at full capacity
+        playerBuckets[playerId] = {
+            tokens = TOKEN_BUCKET.maxTokens,
+            lastRefill = currentTime
+        }
+    end
+
+    local bucket = playerBuckets[playerId]
+
+    -- Refill tokens based on time elapsed
+    local elapsed = currentTime - bucket.lastRefill
+    local tokensToAdd = math.floor(elapsed / TOKEN_BUCKET.refillIntervalMs)
+
+    if tokensToAdd > 0 then
+        bucket.tokens = math.min(TOKEN_BUCKET.maxTokens, bucket.tokens + tokensToAdd)
+        bucket.lastRefill = bucket.lastRefill + (tokensToAdd * TOKEN_BUCKET.refillIntervalMs)
+    end
+
+    return bucket
+end
+
+function ConsumeToken(playerId)
+    local bucket = GetPlayerBucket(playerId)
+
+    if bucket.tokens > 0 then
+        bucket.tokens = bucket.tokens - 1
+        return true
+    end
+
+    return false
+end
+
+function GetTokensRemaining(playerId)
+    local bucket = GetPlayerBucket(playerId)
+    return bucket.tokens
+end
+
+function GetTimeUntilNextToken(playerId)
+    local bucket = GetPlayerBucket(playerId)
+    if bucket.tokens >= TOKEN_BUCKET.maxTokens then
+        return 0
+    end
+
+    local currentTime = GetGameTimer()
+    local elapsed = currentTime - bucket.lastRefill
+    local remaining = TOKEN_BUCKET.refillIntervalMs - elapsed
+
+    return math.max(0, remaining)
+end
+
+-----------------------------------------------------------
+-- Request Queue with Token Bucket
+-----------------------------------------------------------
 function QueueAIRequest(playerId, conversation, playerMessage)
     -- Check if player already has a pending request
     if pendingRequests[playerId] then
         TriggerClientEvent('ai-npcs:client:receiveMessage', playerId,
             "*holds up a finger* Hold on, I'm still thinking...", conversation.npc.id)
         return
+    end
+
+    -- Check if player has tokens available
+    local tokensRemaining = GetTokensRemaining(playerId)
+
+    if tokensRemaining <= 0 then
+        -- No tokens - inform player and queue anyway (will process when token available)
+        local waitTime = math.ceil(GetTimeUntilNextToken(playerId) / 1000)
+        TriggerClientEvent('ai-npcs:client:receiveMessage', playerId,
+            ("*seems busy* Give me a moment... (%ds)"):format(waitTime), conversation.npc.id)
+
+        if Config.Debug.enabled then
+            print(("[AI NPCs] Player %s rate limited - %d tokens, wait %ds"):format(
+                playerId, tokensRemaining, waitTime))
+        end
     end
 
     -- Add to queue
@@ -51,62 +133,98 @@ function ProcessRequestQueue()
     isProcessingQueue = true
     local currentTime = GetGameTimer()
 
-    -- Reset rate limit counter every minute
-    if currentTime - lastMinuteReset > 60000 then
-        requestsThisMinute = 0
-        lastMinuteReset = currentTime
-    end
-
-    -- Check rate limits
-    if requestsThisMinute >= RATE_LIMIT.requestsPerMinute then
-        -- Wait until next minute
-        local waitTime = 60000 - (currentTime - lastMinuteReset) + 100
-        if Config.Debug.enabled then
-            print(("[AI NPCs] Rate limit reached, waiting %dms"):format(waitTime))
-        end
-        SetTimeout(waitTime, ProcessRequestQueue)
-        return
-    end
-
-    -- Check concurrent limit
-    if currentConcurrent >= RATE_LIMIT.maxConcurrent then
+    -- Check global concurrent limit (stagger)
+    if currentConcurrent >= GLOBAL_STAGGER.maxConcurrent then
         SetTimeout(500, ProcessRequestQueue)
         return
     end
 
-    -- Check minimum delay
+    -- Check global minimum delay (stagger)
     local timeSinceLastRequest = currentTime - lastRequestTime
-    if timeSinceLastRequest < RATE_LIMIT.minDelayMs then
-        SetTimeout(RATE_LIMIT.minDelayMs - timeSinceLastRequest, ProcessRequestQueue)
+    if timeSinceLastRequest < GLOBAL_STAGGER.minDelayMs then
+        SetTimeout(GLOBAL_STAGGER.minDelayMs - timeSinceLastRequest, ProcessRequestQueue)
         return
     end
 
-    -- Get next request
-    local request = table.remove(requestQueue, 1)
-    if not request then
-        isProcessingQueue = false
+    -- Find next request that has tokens available
+    local requestIndex = nil
+    for i, request in ipairs(requestQueue) do
+        -- Check if request is too old (player might have left)
+        if currentTime - request.queuedAt > 60000 then
+            pendingRequests[request.playerId] = nil
+            table.remove(requestQueue, i)
+            -- Recurse to check next
+            SetTimeout(0, ProcessRequestQueue)
+            return
+        end
+
+        -- Check if player has tokens
+        if GetTokensRemaining(request.playerId) > 0 then
+            requestIndex = i
+            break
+        end
+    end
+
+    if not requestIndex then
+        -- No requests with available tokens - wait for token refill
+        local minWait = TOKEN_BUCKET.refillIntervalMs
+        for _, request in ipairs(requestQueue) do
+            local wait = GetTimeUntilNextToken(request.playerId)
+            if wait < minWait then
+                minWait = wait
+            end
+        end
+
+        if Config.Debug.enabled then
+            print(("[AI NPCs] All players rate-limited, waiting %dms for token refill"):format(minWait))
+        end
+
+        SetTimeout(minWait + 100, ProcessRequestQueue)
         return
     end
 
-    -- Check if request is too old (player might have left)
-    if currentTime - request.queuedAt > 60000 then
-        pendingRequests[request.playerId] = nil
-        ProcessRequestQueue()
+    -- Get the request and consume token
+    local request = table.remove(requestQueue, requestIndex)
+
+    if not ConsumeToken(request.playerId) then
+        -- Token was consumed between check and now (race condition), requeue
+        table.insert(requestQueue, 1, request)
+        SetTimeout(100, ProcessRequestQueue)
         return
     end
 
     -- Process the request
     lastRequestTime = currentTime
-    requestsThisMinute = requestsThisMinute + 1
     currentConcurrent = currentConcurrent + 1
+
+    if Config.Debug.enabled then
+        print(("[AI NPCs] Processing request for player %s (%d tokens remaining)"):format(
+            request.playerId, GetTokensRemaining(request.playerId)))
+    end
 
     GenerateAIResponseInternal(request.playerId, request.conversation, request.playerMessage, function()
         currentConcurrent = currentConcurrent - 1
         pendingRequests[request.playerId] = nil
-        -- Process next request
-        SetTimeout(RATE_LIMIT.minDelayMs, ProcessRequestQueue)
+        -- Process next request with stagger delay
+        SetTimeout(GLOBAL_STAGGER.minDelayMs, ProcessRequestQueue)
     end)
 end
+
+-----------------------------------------------------------
+-- Cleanup disconnected players
+-----------------------------------------------------------
+AddEventHandler('playerDropped', function(reason)
+    local playerId = source
+    playerBuckets[playerId] = nil
+    pendingRequests[playerId] = nil
+
+    -- Remove any queued requests for this player
+    for i = #requestQueue, 1, -1 do
+        if requestQueue[i].playerId == playerId then
+            table.remove(requestQueue, i)
+        end
+    end
+end)
 
 -----------------------------------------------------------
 -- FALLBACK DIALOGUE SYSTEM (uses Config.FallbackResponses)
@@ -211,7 +329,7 @@ function GenerateAIResponseInternal(playerId, conversation, playerMessage, onCom
     local timeoutTriggered = false
 
     -- Set up timeout handler
-    SetTimeout(RATE_LIMIT.requestTimeoutMs, function()
+    SetTimeout(GLOBAL_STAGGER.requestTimeoutMs, function()
         if not hasResponded then
             timeoutTriggered = true
             print(("[AI NPCs] Request timeout for player %s"):format(playerId))
