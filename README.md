@@ -6,7 +6,7 @@ A comprehensive AI-powered NPC conversation system for QBCore FiveM servers. NPC
 
 ### Core Systems
 
-- **Dynamic AI Conversations**: NPCs respond intelligently using Claude AI or OpenAI GPT
+- **Dynamic AI Conversations**: NPCs respond intelligently using Ollama (local), Claude AI, or OpenAI GPT
 - **Text-to-Speech Audio**: Optional ElevenLabs voice synthesis for immersive conversations
 - **Player Context Awareness**: NPCs react differently based on your job, items, cash, and gang affiliation
 - **Trust/Reputation System**: Build relationships with NPCs to unlock better intel
@@ -63,7 +63,10 @@ Trust is earned through:
    - ox_lib
    - ox_target
    - oxmysql
-   - Anthropic API key (https://console.anthropic.com/) or OpenAI API key
+   - AI Provider (choose one):
+     - **Ollama** (FREE - runs locally on your server)
+     - Anthropic API key (https://console.anthropic.com/)
+     - OpenAI API key (https://platform.openai.com/)
 
 2. **Database Setup**:
    Run the SQL schema to create required tables:
@@ -274,13 +277,48 @@ TriggerServerEvent('ai-npcs:server:endConversation')
 
 ## API Setup
 
-### Anthropic Claude (Recommended)
+### Ollama (Recommended - FREE)
+Run AI locally on your server hardware. No API costs, no rate limits, full privacy.
+
+**Requirements:** GPU with 8GB+ VRAM (RTX 3070, RTX 3080, etc.)
+
+1. Install Ollama:
+   ```bash
+   curl -fsSL https://ollama.com/install.sh | sh
+   ```
+
+2. Pull a model (dolphin-llama3 recommended for uncensored RP):
+   ```bash
+   ollama pull dolphin-llama3:8b
+   ```
+
+3. Start the Ollama server:
+   ```bash
+   ollama serve
+   ```
+
+4. Configure `config.lua`:
+   ```lua
+   Config.AI = {
+       provider = "ollama",
+       apiUrl = "http://127.0.0.1:11434",
+       apiKey = "not-needed",
+       model = "dolphin-llama3:8b",
+       maxTokens = 200,
+       temperature = 0.85,
+       ollamaNativeApi = true,
+   }
+   ```
+
+5. Test with `/ainpc test` in-game
+
+### Anthropic Claude (Cloud)
 1. Visit https://console.anthropic.com/
 2. Create API key
 3. Set `Config.AI.provider = "anthropic"`
 4. Add key to `Config.AI.apiKey`
 
-### OpenAI GPT
+### OpenAI GPT (Cloud)
 1. Visit https://platform.openai.com/api-keys
 2. Create API key
 3. Set `Config.AI.provider = "openai"`
@@ -302,24 +340,67 @@ TriggerServerEvent('ai-npcs:server:endConversation')
 5. **Build Trust**: Return regularly to build relationships
 6. **Get Intel**: Once trusted, ask about specific topics
 
+## Admin Commands
+
+### /ainpc - AI NPC Management
+| Command | Description |
+|---------|-------------|
+| `/ainpc` | Show all available commands |
+| `/ainpc tokens [id]` | Check player token bucket status |
+| `/ainpc refill <id>` | Refill a player's conversation tokens |
+| `/ainpc refillall` | Refill all players' tokens |
+| `/ainpc queue` | Show request queue status |
+| `/ainpc budget` | Show global token budget status |
+| `/ainpc provider` | Show current AI provider info |
+| `/ainpc test` | Test AI provider connection |
+| `/ainpc debug` | Toggle debug mode |
+
+### /createnpc - NPC Creation Helper
+Generate config templates for new NPCs:
+```
+/createnpc <id> [name] [role]
+```
+
+Example:
+```
+/createnpc my_dealer "Street Dealer" dealer
+```
+
+This outputs a config template to F8 console with your current position as the spawn location.
+
 ## Cost Optimization
 
-### AI API Costs
-- Claude Haiku: ~$0.00025/1k input, ~$0.00125/1k output
-- GPT-4: ~$0.03/1k tokens (more expensive)
+### AI Provider Costs
+| Provider | Cost | Notes |
+|----------|------|-------|
+| **Ollama** | FREE | Runs locally, requires GPU |
+| Claude Haiku | ~$0.00025/1k input | Fast and cheap |
+| GPT-3.5 Turbo | ~$0.0015/1k tokens | Budget cloud option |
+| GPT-4 | ~$0.03/1k tokens | Expensive |
 
 ### Reducing Costs
-- Use Claude Haiku (default) - fast and cheap
+- **Use Ollama** - completely free, runs on your hardware
+- Use Claude Haiku if cloud is needed - fast and cheap
 - Limit max tokens (default 200)
 - Set reasonable conversation limits
 - Enable audio caching for TTS
+- Enable Global Token Budget for Ollama to prevent server overload
 
 ## Troubleshooting
 
 ### NPCs Not Responding
-- Check API key validity
-- Verify internet connectivity
+- Check API key validity (or Ollama is running)
+- Verify internet connectivity (for cloud providers)
 - Check server console for HTTP errors
+- Run `/ainpc test` to diagnose connection issues
+
+### Ollama Not Working
+- Ensure Ollama is running: `ollama serve`
+- Check model is pulled: `ollama list`
+- Verify endpoint: `curl http://127.0.0.1:11434/api/tags`
+- Check GPU has enough VRAM (8GB+ recommended)
+- Look for OOM errors in Ollama logs
+- Try a smaller model: `ollama pull dolphin-mistral:7b`
 
 ### NPCs Not Moving
 - Ensure `Config.Movement.enabled = true`
@@ -336,6 +417,17 @@ TriggerServerEvent('ai-npcs:server:endConversation')
 - Verify schedule time ranges are correct
 
 ## Version History
+
+- **v2.1.0** - Ollama & Local LLM Support
+  - **Native Ollama provider** - Run AI locally for FREE
+  - Global Token Budget system for server-wide rate limiting
+  - Enhanced error handling with provider-specific diagnostics
+  - `/ainpc test` command to test AI connection
+  - `/ainpc provider` command to view provider info
+  - `/ainpc budget` command to view token budget status
+  - `/createnpc` helper command for easy NPC creation
+  - Extended timeouts for local model inference (120s)
+  - Ollama connection troubleshooting in console
 
 - **v2.0.0** - Major overhaul
   - Added trust/reputation system with database persistence
