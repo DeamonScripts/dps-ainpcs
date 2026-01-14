@@ -3,13 +3,46 @@ Config = {}
 -----------------------------------------------------------
 -- AI Provider Configuration
 -----------------------------------------------------------
+-- Supported providers:
+--   "ollama"    - Local LLM via Ollama (FREE, runs on your hardware)
+--   "openai"    - OpenAI API (GPT-3.5, GPT-4, etc.)
+--   "anthropic" - Anthropic Claude API
+-----------------------------------------------------------
 Config.AI = {
-    provider = "anthropic", -- "openai" or "anthropic"
-    apiUrl = "https://api.anthropic.com/v1/messages",
-    apiKey = "YOUR_ANTHROPIC_API_KEY_HERE", -- Get from https://console.anthropic.com/
-    model = "claude-3-haiku-20240307", -- Fast and cost-effective for NPCs
-    maxTokens = 200,
-    temperature = 0.85
+    -- OPTION 1: Ollama (Local LLM - Recommended for cost savings)
+    -- Install: https://ollama.com/download
+    -- Pull model: ollama pull dolphin-llama3:8b
+    -- Start server: ollama serve
+    provider = "ollama",
+    apiUrl = "http://127.0.0.1:11434",  -- Ollama default endpoint (no /api/chat needed)
+    apiKey = "not-needed",               -- Ollama doesn't require API key locally
+    model = "dolphin-llama3:8b",         -- Uncensored model that fits in 8GB VRAM
+    maxTokens = 200,                     -- Keep low for faster responses
+    temperature = 0.85,                  -- Higher = more creative
+    ollamaNativeApi = true,              -- Use native Ollama API (faster) vs OpenAI-compat
+
+    -- OPTION 2: OpenAI
+    -- provider = "openai",
+    -- apiUrl = "https://api.openai.com/v1/chat/completions",
+    -- apiKey = "YOUR_OPENAI_API_KEY_HERE",
+    -- model = "gpt-3.5-turbo",
+    -- maxTokens = 200,
+    -- temperature = 0.85,
+
+    -- OPTION 3: Anthropic Claude
+    -- provider = "anthropic",
+    -- apiUrl = "https://api.anthropic.com/v1/messages",
+    -- apiKey = "YOUR_ANTHROPIC_API_KEY_HERE",
+    -- model = "claude-3-haiku-20240307",
+    -- maxTokens = 200,
+    -- temperature = 0.85,
+
+    -- Global Token Budget (optional - prevents overloading local models)
+    -- This limits total tokens across ALL players per minute
+    globalBudget = {
+        enabled = true,                  -- Enable for Ollama to prevent overload
+        maxTokensPerMinute = 2000,       -- Server-wide limit (adjust based on hardware)
+    }
 }
 
 -----------------------------------------------------------

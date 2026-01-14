@@ -18,11 +18,20 @@ local TOKEN_BUCKET = {
     refillIntervalMs = 12000,   -- 1 token every 12 seconds (60000/5)
 }
 
+-- Global Token Budget (server-wide limits to prevent overloading local models)
+local GLOBAL_TOKEN_BUDGET = {
+    enabled = false,            -- Enable via Config.AI.globalBudget
+    maxTokensPerMinute = 1000,  -- Server-wide tokens per minute
+    currentUsage = 0,           -- Tokens used this minute
+    lastReset = 0,              -- Last reset timestamp
+}
+
 -- Global stagger configuration (prevents API burst)
 local GLOBAL_STAGGER = {
     minDelayMs = 300,           -- Minimum ms between any API calls
     maxConcurrent = 5,          -- Max concurrent API requests
-    requestTimeoutMs = 30000    -- 30 second timeout per request
+    requestTimeoutMs = 30000,   -- 30 second timeout per request (cloud APIs)
+    ollamaTimeoutMs = 120000,   -- 120 second timeout for local Ollama (slower)
 }
 
 -----------------------------------------------------------
@@ -83,6 +92,52 @@ function GetTimeUntilNextToken(playerId)
 end
 
 -----------------------------------------------------------
+-- Global Token Budget Management (Server-Wide Limits)
+-----------------------------------------------------------
+function InitGlobalTokenBudget()
+    if Config.AI and Config.AI.globalBudget then
+        GLOBAL_TOKEN_BUDGET.enabled = Config.AI.globalBudget.enabled or false
+        GLOBAL_TOKEN_BUDGET.maxTokensPerMinute = Config.AI.globalBudget.maxTokensPerMinute or 1000
+    end
+    GLOBAL_TOKEN_BUDGET.lastReset = GetGameTimer()
+
+    if Config.Debug and Config.Debug.enabled and GLOBAL_TOKEN_BUDGET.enabled then
+        print(("[AI NPCs] Global Token Budget: %d tokens/minute"):format(GLOBAL_TOKEN_BUDGET.maxTokensPerMinute))
+    end
+end
+
+function CheckGlobalBudget(estimatedTokens)
+    if not GLOBAL_TOKEN_BUDGET.enabled then return true end
+
+    local currentTime = GetGameTimer()
+
+    -- Reset budget every minute
+    if currentTime - GLOBAL_TOKEN_BUDGET.lastReset >= 60000 then
+        GLOBAL_TOKEN_BUDGET.currentUsage = 0
+        GLOBAL_TOKEN_BUDGET.lastReset = currentTime
+    end
+
+    return (GLOBAL_TOKEN_BUDGET.currentUsage + estimatedTokens) <= GLOBAL_TOKEN_BUDGET.maxTokensPerMinute
+end
+
+function ConsumeGlobalBudget(tokens)
+    if not GLOBAL_TOKEN_BUDGET.enabled then return end
+    GLOBAL_TOKEN_BUDGET.currentUsage = GLOBAL_TOKEN_BUDGET.currentUsage + tokens
+end
+
+function GetGlobalBudgetRemaining()
+    if not GLOBAL_TOKEN_BUDGET.enabled then return -1 end -- -1 means unlimited
+    return math.max(0, GLOBAL_TOKEN_BUDGET.maxTokensPerMinute - GLOBAL_TOKEN_BUDGET.currentUsage)
+end
+
+function GetTimeUntilBudgetReset()
+    if not GLOBAL_TOKEN_BUDGET.enabled then return 0 end
+    local currentTime = GetGameTimer()
+    local elapsed = currentTime - GLOBAL_TOKEN_BUDGET.lastReset
+    return math.max(0, 60000 - elapsed)
+end
+
+-----------------------------------------------------------
 -- Request Queue with Token Bucket
 -----------------------------------------------------------
 function QueueAIRequest(playerId, conversation, playerMessage)
@@ -90,6 +145,20 @@ function QueueAIRequest(playerId, conversation, playerMessage)
     if pendingRequests[playerId] then
         TriggerClientEvent('ai-npcs:client:receiveMessage', playerId,
             "*holds up a finger* Hold on, I'm still thinking...", conversation.npc.id)
+        return
+    end
+
+    -- Check global token budget (server-wide limit for local models)
+    local estimatedTokens = Config.AI.maxTokens or 200
+    if not CheckGlobalBudget(estimatedTokens) then
+        local waitTime = math.ceil(GetTimeUntilBudgetReset() / 1000)
+        TriggerClientEvent('ai-npcs:client:receiveMessage', playerId,
+            ("*looks distracted* The city's busy right now... Try again in %ds."):format(waitTime), conversation.npc.id)
+
+        if Config.Debug and Config.Debug.enabled then
+            print(("[AI NPCs] Player %s blocked by global budget - %d remaining, reset in %ds"):format(
+                playerId, GetGlobalBudgetRemaining(), waitTime))
+        end
         return
     end
 
@@ -102,7 +171,7 @@ function QueueAIRequest(playerId, conversation, playerMessage)
         TriggerClientEvent('ai-npcs:client:receiveMessage', playerId,
             ("*seems busy* Give me a moment... (%ds)"):format(waitTime), conversation.npc.id)
 
-        if Config.Debug.enabled then
+        if Config.Debug and Config.Debug.enabled then
             print(("[AI NPCs] Player %s rate limited - %d tokens, wait %ds"):format(
                 playerId, tokensRemaining, waitTime))
         end
@@ -243,9 +312,19 @@ function GetFallbackResponse(npc, reason)
         end
     end
 
-    -- Use API error messages for actual failures
+    -- Use specific error messages for different failure types
     if reason == "api_error" or reason == "timeout" then
         category = "api_error"
+    elseif reason == "ollama_timeout" then
+        -- Specific message for slow local model
+        return "*pauses mid-thought* ...Give me a second, thinking takes time."
+    elseif reason == "ollama_offline" then
+        -- Specific message for offline local model
+        return "*stares blankly* ...I'm not feeling myself right now. Come back later."
+    elseif reason == "connection_error" then
+        return "*seems disconnected* ...Can't think straight right now."
+    elseif reason == "server_error" then
+        return "*winces* ...Brain's not working. Try again in a minute."
     end
 
     -- Get from config, fallback to generic if category missing
@@ -286,9 +365,10 @@ function GenerateAIResponseInternal(playerId, conversation, playerMessage, onCom
     end
 
     -- Prepare API request based on provider
-    local requestData, headers
+    local requestData, headers, apiUrl
+    local provider = Config.AI.provider or "openai"
 
-    if Config.AI.provider == "anthropic" then
+    if provider == "anthropic" then
         -- Anthropic Claude API format
         requestData = {
             model = Config.AI.model,
@@ -303,8 +383,64 @@ function GenerateAIResponseInternal(playerId, conversation, playerMessage, onCom
             ["x-api-key"] = Config.AI.apiKey,
             ["anthropic-version"] = "2023-06-01"
         }
+        apiUrl = Config.AI.apiUrl
+
+    elseif provider == "ollama" then
+        -- Native Ollama API format (local LLM)
+        -- Ollama can use either native /api/chat or OpenAI-compatible /v1/chat/completions
+        local useNativeApi = Config.AI.ollamaNativeApi ~= false -- Default to native
+
+        if useNativeApi then
+            -- Native Ollama /api/chat endpoint
+            requestData = {
+                model = Config.AI.model,
+                messages = {},
+                stream = false, -- FiveM can't handle streaming
+                options = {
+                    temperature = Config.AI.temperature or 0.85,
+                    num_predict = Config.AI.maxTokens or 200,
+                }
+            }
+
+            -- Add system prompt as first message for Ollama
+            table.insert(requestData.messages, {
+                role = "system",
+                content = systemPrompt
+            })
+
+            -- Add conversation history
+            for _, msg in ipairs(messages) do
+                table.insert(requestData.messages, msg)
+            end
+
+            apiUrl = (Config.AI.apiUrl or "http://127.0.0.1:11434") .. "/api/chat"
+        else
+            -- OpenAI-compatible endpoint (for Ollama with /v1/chat/completions)
+            table.insert(messages, 1, {
+                role = "system",
+                content = systemPrompt
+            })
+
+            requestData = {
+                model = Config.AI.model,
+                messages = messages,
+                max_tokens = Config.AI.maxTokens,
+                temperature = Config.AI.temperature
+            }
+
+            apiUrl = (Config.AI.apiUrl or "http://127.0.0.1:11434") .. "/v1/chat/completions"
+        end
+
+        -- Ollama doesn't need auth for local, but support optional key for remote
+        headers = {
+            ["Content-Type"] = "application/json"
+        }
+        if Config.AI.apiKey and Config.AI.apiKey ~= "" and Config.AI.apiKey ~= "not-needed" then
+            headers["Authorization"] = "Bearer " .. Config.AI.apiKey
+        end
+
     else
-        -- OpenAI API format - prepend system message
+        -- OpenAI API format (default) - also works with OpenAI-compatible APIs
         table.insert(messages, 1, {
             role = "system",
             content = systemPrompt
@@ -319,28 +455,47 @@ function GenerateAIResponseInternal(playerId, conversation, playerMessage, onCom
 
         headers = {
             ["Content-Type"] = "application/json",
-            ["Authorization"] = "Bearer " .. Config.AI.apiKey
+            ["Authorization"] = "Bearer " .. (Config.AI.apiKey or "")
         }
+        apiUrl = Config.AI.apiUrl
     end
 
-    -- Timeout tracking
+    -- Timeout tracking - use longer timeout for local Ollama models
     local requestId = GetGameTimer()
     local hasResponded = false
     local timeoutTriggered = false
+    local timeoutMs = (provider == "ollama") and GLOBAL_STAGGER.ollamaTimeoutMs or GLOBAL_STAGGER.requestTimeoutMs
 
-    -- Set up timeout handler
-    SetTimeout(GLOBAL_STAGGER.requestTimeoutMs, function()
+    -- Set up timeout handler with enhanced error info
+    SetTimeout(timeoutMs, function()
         if not hasResponded then
             timeoutTriggered = true
-            print(("[AI NPCs] Request timeout for player %s"):format(playerId))
-            local fallback = GetFallbackResponse(npc, "timeout")
+            local providerInfo = provider == "ollama" and " (local model may be slow/unresponsive)" or ""
+            print(("[AI NPCs] Request timeout for player %s after %dms%s"):format(playerId, timeoutMs, providerInfo))
+
+            -- Provider-specific timeout messages
+            local fallbackReason = "timeout"
+            if provider == "ollama" then
+                fallbackReason = "ollama_timeout"
+            end
+
+            local fallback = GetFallbackResponse(npc, fallbackReason)
             TriggerClientEvent('ai-npcs:client:receiveMessage', playerId, fallback, npc.id)
+
+            -- Log additional debug info for Ollama timeouts
+            if provider == "ollama" and Config.Debug and Config.Debug.enabled then
+                print("[AI NPCs] Ollama timeout - check if:")
+                print("  1. Ollama is running: curl " .. (Config.AI.apiUrl or "http://127.0.0.1:11434"))
+                print("  2. Model is loaded: ollama list")
+                print("  3. GPU has enough VRAM for model")
+            end
+
             if onComplete then onComplete() end
         end
     end)
 
     -- Make API request
-    PerformHttpRequest(Config.AI.apiUrl, function(statusCode, response, respHeaders)
+    PerformHttpRequest(apiUrl, function(statusCode, response, respHeaders)
         -- Ignore if timeout already triggered
         if timeoutTriggered then return end
         hasResponded = true
@@ -348,13 +503,32 @@ function GenerateAIResponseInternal(playerId, conversation, playerMessage, onCom
         if statusCode == 200 then
             local success, data = pcall(json.decode, response)
             local aiResponse = nil
+            local tokensUsed = Config.AI.maxTokens or 200 -- Estimate if not provided
 
             if success then
-                if Config.AI.provider == "anthropic" and data.content and data.content[1] then
+                if provider == "anthropic" and data.content and data.content[1] then
+                    -- Anthropic Claude response
                     aiResponse = data.content[1].text
+                    if data.usage then
+                        tokensUsed = data.usage.output_tokens or tokensUsed
+                    end
+                elseif provider == "ollama" and data.message then
+                    -- Native Ollama /api/chat response
+                    aiResponse = data.message.content
+                    -- Ollama provides eval_count for tokens generated
+                    if data.eval_count then
+                        tokensUsed = data.eval_count
+                    end
                 elseif data.choices and data.choices[1] then
+                    -- OpenAI / OpenAI-compatible response (including Ollama /v1/)
                     aiResponse = data.choices[1].message.content
+                    if data.usage then
+                        tokensUsed = data.usage.completion_tokens or tokensUsed
+                    end
                 end
+
+                -- Consume global token budget
+                ConsumeGlobalBudget(tokensUsed)
             end
 
             if aiResponse then
@@ -389,8 +563,32 @@ function GenerateAIResponseInternal(playerId, conversation, playerMessage, onCom
             print("[AI NPCs] API rate limit hit (429)")
             local fallback = GetFallbackResponse(npc, "api_error")
             TriggerClientEvent('ai-npcs:client:receiveMessage', playerId, fallback, npc.id)
+        elseif statusCode == 0 or statusCode == nil then
+            -- Connection failed - likely Ollama not running or network issue
+            print(("[AI NPCs] Connection failed to %s (provider: %s)"):format(apiUrl, provider))
+
+            if provider == "ollama" then
+                print("[AI NPCs] Ollama connection failed - troubleshooting:")
+                print("  1. Is Ollama running? Start with: ollama serve")
+                print("  2. Check endpoint: " .. apiUrl)
+                print("  3. Test with: curl " .. apiUrl)
+                print("  4. Model loaded? ollama pull " .. (Config.AI.model or "dolphin-llama3:8b"))
+                local fallback = GetFallbackResponse(npc, "ollama_offline")
+                TriggerClientEvent('ai-npcs:client:receiveMessage', playerId, fallback, npc.id)
+            else
+                local fallback = GetFallbackResponse(npc, "connection_error")
+                TriggerClientEvent('ai-npcs:client:receiveMessage', playerId, fallback, npc.id)
+            end
+        elseif statusCode >= 500 then
+            -- Server error
+            print(("[AI NPCs] Server error %d from %s"):format(statusCode, provider))
+            if provider == "ollama" then
+                print("[AI NPCs] Ollama server error - model may have crashed or OOM")
+            end
+            local fallback = GetFallbackResponse(npc, "server_error")
+            TriggerClientEvent('ai-npcs:client:receiveMessage', playerId, fallback, npc.id)
         else
-            print(("[AI NPCs] AI API request failed with status: %s"):format(statusCode))
+            print(("[AI NPCs] AI API request failed with status: %s (provider: %s)"):format(statusCode, provider))
             print("[AI NPCs] Response: " .. tostring(response))
             local fallback = GetFallbackResponse(npc, "api_error")
             TriggerClientEvent('ai-npcs:client:receiveMessage', playerId, fallback, npc.id)
@@ -849,6 +1047,147 @@ RegisterCommand('ainpc', function(source, args, rawCommand)
             })
         end
 
+    elseif subcommand == 'budget' then
+        -- Show global token budget status
+        if not GLOBAL_TOKEN_BUDGET.enabled then
+            print("[AI NPCs] Global Token Budget is DISABLED")
+            if source > 0 then
+                TriggerClientEvent('ox_lib:notify', source, {
+                    title = 'Budget Status',
+                    description = 'Global Token Budget is disabled',
+                    type = 'info'
+                })
+            end
+        else
+            local remaining = GetGlobalBudgetRemaining()
+            local resetIn = math.ceil(GetTimeUntilBudgetReset() / 1000)
+            local output = ("^3[AI NPCs] Global Token Budget:^7\n")
+            output = output .. ("  Max per minute: %d\n"):format(GLOBAL_TOKEN_BUDGET.maxTokensPerMinute)
+            output = output .. ("  Used this minute: %d\n"):format(GLOBAL_TOKEN_BUDGET.currentUsage)
+            output = output .. ("  Remaining: %d\n"):format(remaining)
+            output = output .. ("  Reset in: %ds\n"):format(resetIn)
+            print(output)
+
+            if source > 0 then
+                TriggerClientEvent('ox_lib:notify', source, {
+                    title = 'Budget Status',
+                    description = ('%d/%d tokens, reset in %ds'):format(
+                        remaining, GLOBAL_TOKEN_BUDGET.maxTokensPerMinute, resetIn
+                    ),
+                    type = 'info'
+                })
+            end
+        end
+
+    elseif subcommand == 'provider' then
+        -- Show current AI provider info
+        local provider = Config.AI.provider or "openai"
+        local model = Config.AI.model or "unknown"
+        local apiUrl = Config.AI.apiUrl or "not set"
+        local output = ("^3[AI NPCs] AI Provider Info:^7\n")
+        output = output .. ("  Provider: %s\n"):format(provider)
+        output = output .. ("  Model: %s\n"):format(model)
+        output = output .. ("  API URL: %s\n"):format(apiUrl)
+        if provider == "ollama" then
+            output = output .. ("  Native API: %s\n"):format(Config.AI.ollamaNativeApi ~= false and "Yes" or "No (OpenAI compat)")
+            output = output .. ("  Timeout: %dms\n"):format(GLOBAL_STAGGER.ollamaTimeoutMs)
+        end
+        print(output)
+
+        if source > 0 then
+            TriggerClientEvent('ox_lib:notify', source, {
+                title = 'AI Provider',
+                description = ('%s - %s'):format(provider, model),
+                type = 'info'
+            })
+        end
+
+    elseif subcommand == 'test' then
+        -- Quick test of AI provider connection
+        local provider = Config.AI.provider or "openai"
+        print(("[AI NPCs] Testing %s connection..."):format(provider))
+
+        if source > 0 then
+            TriggerClientEvent('ox_lib:notify', source, {
+                title = 'Testing AI',
+                description = 'Sending test request to ' .. provider,
+                type = 'info'
+            })
+        end
+
+        -- Build a minimal test request
+        local testUrl, testData, testHeaders
+
+        if provider == "ollama" then
+            local useNative = Config.AI.ollamaNativeApi ~= false
+            if useNative then
+                testUrl = (Config.AI.apiUrl or "http://127.0.0.1:11434") .. "/api/chat"
+                testData = {
+                    model = Config.AI.model or "dolphin-llama3:8b",
+                    messages = {{ role = "user", content = "Say 'test ok' in 5 words or less." }},
+                    stream = false,
+                    options = { num_predict = 20 }
+                }
+            else
+                testUrl = (Config.AI.apiUrl or "http://127.0.0.1:11434") .. "/v1/chat/completions"
+                testData = {
+                    model = Config.AI.model or "dolphin-llama3:8b",
+                    messages = {{ role = "user", content = "Say 'test ok' in 5 words or less." }},
+                    max_tokens = 20
+                }
+            end
+            testHeaders = { ["Content-Type"] = "application/json" }
+        elseif provider == "anthropic" then
+            testUrl = Config.AI.apiUrl
+            testData = {
+                model = Config.AI.model,
+                messages = {{ role = "user", content = "Say 'test ok' in 5 words or less." }},
+                max_tokens = 20
+            }
+            testHeaders = {
+                ["Content-Type"] = "application/json",
+                ["x-api-key"] = Config.AI.apiKey,
+                ["anthropic-version"] = "2023-06-01"
+            }
+        else
+            testUrl = Config.AI.apiUrl
+            testData = {
+                model = Config.AI.model,
+                messages = {{ role = "user", content = "Say 'test ok' in 5 words or less." }},
+                max_tokens = 20
+            }
+            testHeaders = {
+                ["Content-Type"] = "application/json",
+                ["Authorization"] = "Bearer " .. (Config.AI.apiKey or "")
+            }
+        end
+
+        local startTime = GetGameTimer()
+        PerformHttpRequest(testUrl, function(statusCode, response, respHeaders)
+            local elapsed = GetGameTimer() - startTime
+            if statusCode == 200 then
+                print(("[AI NPCs] ^2SUCCESS^7 - %s responded in %dms"):format(provider, elapsed))
+                print("[AI NPCs] Response: " .. tostring(response):sub(1, 200))
+                if source > 0 then
+                    TriggerClientEvent('ox_lib:notify', source, {
+                        title = 'Test Success',
+                        description = ('%s OK in %dms'):format(provider, elapsed),
+                        type = 'success'
+                    })
+                end
+            else
+                print(("[AI NPCs] ^1FAILED^7 - Status %s after %dms"):format(tostring(statusCode), elapsed))
+                print("[AI NPCs] Response: " .. tostring(response))
+                if source > 0 then
+                    TriggerClientEvent('ox_lib:notify', source, {
+                        title = 'Test Failed',
+                        description = ('Status %s - check console'):format(tostring(statusCode)),
+                        type = 'error'
+                    })
+                end
+            end
+        end, 'POST', json.encode(testData), testHeaders)
+
     else
         -- Show help
         local help = [[
@@ -857,6 +1196,9 @@ RegisterCommand('ainpc', function(source, args, rawCommand)
   /ainpc refill <id>    - Refill a player's tokens to max
   /ainpc refillall      - Refill all players' tokens
   /ainpc queue          - Show request queue status
+  /ainpc budget         - Show global token budget status
+  /ainpc provider       - Show current AI provider info
+  /ainpc test           - Test AI provider connection
   /ainpc debug          - Toggle debug mode
 ]]
         print(help)
@@ -879,4 +1221,164 @@ exports('RefillPlayerTokens', function(playerId)
         lastRefill = GetGameTimer()
     }
     return true
+end)
+
+-- Global Budget exports
+exports('GetGlobalBudgetRemaining', GetGlobalBudgetRemaining)
+exports('GetGlobalBudgetStatus', function()
+    return {
+        enabled = GLOBAL_TOKEN_BUDGET.enabled,
+        maxTokensPerMinute = GLOBAL_TOKEN_BUDGET.maxTokensPerMinute,
+        currentUsage = GLOBAL_TOKEN_BUDGET.currentUsage,
+        remaining = GetGlobalBudgetRemaining(),
+        resetIn = GetTimeUntilBudgetReset()
+    }
+end)
+
+-----------------------------------------------------------
+-- /createNPC HELPER COMMAND
+-- Generates a config template for a new NPC
+-----------------------------------------------------------
+RegisterCommand('createnpc', function(source, args, rawCommand)
+    if source > 0 and not IsAdmin(source) then
+        TriggerClientEvent('ox_lib:notify', source, {
+            title = 'Access Denied',
+            description = 'Admin only command',
+            type = 'error'
+        })
+        return
+    end
+
+    -- Usage: /createnpc <id> [name] [role]
+    local npcId = args[1]
+    local npcName = args[2] or "New NPC"
+    local npcRole = args[3] or "informant"
+
+    if not npcId then
+        local usage = [[
+^3[AI NPCs] /createnpc Usage:^7
+  /createnpc <id> [name] [role]
+
+Example:
+  /createnpc my_dealer "Street Dealer" dealer
+
+This will output a config template to add to config.lua
+]]
+        print(usage)
+        if source > 0 then
+            TriggerClientEvent('ox_lib:notify', source, {
+                title = 'Create NPC',
+                description = 'Usage: /createnpc <id> [name] [role]',
+                type = 'info'
+            })
+        end
+        return
+    end
+
+    -- Get player position if in-game
+    local coords = "vector4(0.0, 0.0, 0.0, 0.0)"
+    if source > 0 then
+        local playerPed = GetPlayerPed(source)
+        if playerPed and playerPed ~= 0 then
+            local pos = GetEntityCoords(playerPed)
+            local heading = GetEntityHeading(playerPed)
+            coords = ("vector4(%.2f, %.2f, %.2f, %.1f)"):format(pos.x, pos.y, pos.z, heading)
+        end
+    end
+
+    -- Generate NPC template
+    local template = ([[
+-----------------------------------------------------------
+-- ADD THIS TO YOUR config.lua IN THE Config.NPCs TABLE
+-----------------------------------------------------------
+{
+    id = "%s",
+    name = "%s",
+    model = "a_m_m_business_01",  -- Change to desired ped model
+    blip = { sprite = 280, color = 1, scale = 0.6, label = "%s" },
+    homeLocation = %s,
+    movement = {
+        pattern = "stationary",  -- "stationary", "wander", "patrol", or "schedule"
+        locations = {}
+    },
+    schedule = nil,  -- Set time-based availability
+    role = "%s",
+    voice = Config.Voices.male_calm,  -- See Config.Voices
+    trustCategory = "criminal",  -- Separate trust tracking per category
+
+    personality = {
+        type = "%s",
+        traits = "Describe personality traits here",
+        knowledge = "What does this NPC know about?",
+        greeting = "*looks at you* What do you want?"
+    },
+
+    contextReactions = {
+        copReaction = "extremely_suspicious",  -- How NPC reacts to cops
+        hasDrugs = "more_open",
+        hasMoney = "greedy",
+        hasCrimeTools = "respectful"
+    },
+
+    intel = {
+        {
+            tier = "rumors",
+            topics = {"general_info"},
+            trustRequired = 0,
+            price = 0
+        },
+        {
+            tier = "basic",
+            topics = {"specific_info"},
+            trustRequired = 10,
+            price = "low"
+        }
+    },
+
+    systemPrompt = [[You are %s. Write your character's personality and knowledge here.
+
+YOUR PERSONALITY:
+- Add traits
+
+WHAT YOU KNOW:
+- Add knowledge areas
+
+Keep responses under 100 words. Stay in character.]]
+},
+-----------------------------------------------------------
+]]):format(npcId, npcName, npcName, coords, npcRole, npcRole, npcName)
+
+    print(template)
+
+    if source > 0 then
+        TriggerClientEvent('ox_lib:notify', source, {
+            title = 'NPC Template Generated',
+            description = 'Check F8 console for config template',
+            type = 'success'
+        })
+    end
+end, false)
+
+-----------------------------------------------------------
+-- INITIALIZATION
+-----------------------------------------------------------
+CreateThread(function()
+    -- Initialize global token budget from config
+    Wait(100)  -- Wait for config to load
+    InitGlobalTokenBudget()
+
+    -- Log provider info on startup
+    local provider = Config.AI and Config.AI.provider or "not configured"
+    local model = Config.AI and Config.AI.model or "not configured"
+    print(("^2[AI NPCs]^7 AI Provider: %s (%s)"):format(provider, model))
+
+    if provider == "ollama" then
+        print("^2[AI NPCs]^7 Ollama mode - using local LLM")
+        print(("^2[AI NPCs]^7 Ollama endpoint: %s"):format(Config.AI.apiUrl or "http://127.0.0.1:11434"))
+        print(("^2[AI NPCs]^7 Timeout: %dms (extended for local inference)"):format(GLOBAL_STAGGER.ollamaTimeoutMs))
+    end
+
+    if GLOBAL_TOKEN_BUDGET.enabled then
+        print(("^2[AI NPCs]^7 Global Token Budget: %d tokens/minute"):format(GLOBAL_TOKEN_BUDGET.maxTokensPerMinute))
+    end
 end)
