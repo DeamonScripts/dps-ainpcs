@@ -22,7 +22,74 @@ CreateThread(function()
     print("^2[AI NPCs]^7 Trust system: " .. (Config.Trust.enabled and "ENABLED" or "DISABLED"))
     print("^2[AI NPCs]^7 Database persistence: ENABLED (batch mode)")
     print("^2[AI NPCs]^7 Player context: ENABLED")
+
+    -- Report shared characters integration
+    if SharedCharacters and SharedCharacters.pool then
+        print("^2[AI NPCs]^7 Shared character pool: LOADED (" .. #SharedCharacters.pool .. " characters)")
+    else
+        print("^3[AI NPCs]^7 Shared character pool: NOT AVAILABLE (ac-pedinteraction not running?)")
+    end
 end)
+
+-----------------------------------------------------------
+-- SHARED CHARACTER AVAILABILITY CHECK
+-----------------------------------------------------------
+-- Checks if a shared character is available (not in jail)
+-- Uses ac-pedinteraction's jail status cache for performance
+function IsSharedCharacterAvailable(characterId)
+    -- First check if this is a shared character
+    if not SharedCharacters or not SharedCharacters.pool then
+        return true  -- No shared pool, assume available
+    end
+
+    local char = SharedCharacters.GetById(characterId)
+    if not char then
+        return true  -- Not a shared character, assume available
+    end
+
+    -- Use ac-pedinteraction's cached jail status check
+    local available = exports['ac-pedinteraction']:IsCharacterAvailable(char.firstname, char.lastname)
+
+    if Config.Debug and Config.Debug.enabled and not available then
+        print(("[AI NPCs] Character %s %s is currently in jail"):format(char.firstname, char.lastname))
+    end
+
+    return available
+end
+
+-- Listen for arrest events from ac-pedinteraction
+RegisterNetEvent('dps-ainpcs:characterArrested', function(firstname, lastname, jailHours)
+    print(("[AI NPCs] ^3Character arrested: %s %s for %d hours^7"):format(firstname, lastname, jailHours or 0))
+
+    -- Find active conversations with this character and end them
+    local charId = string.lower(firstname) .. "_" .. string.lower(lastname)
+    for playerId, conversation in pairs(activeConversations) do
+        if conversation.npcId == charId then
+            TriggerClientEvent('ai-npcs:client:endConversation', playerId,
+                "*Police sirens in the distance* I gotta go... NOW!")
+            UnlockNPC(conversation.npcId, playerId)
+            activeConversations[playerId] = nil
+            print(("[AI NPCs] Ended conversation with arrested NPC for player %s"):format(playerId))
+        end
+    end
+end)
+
+-- Get shared character data for NPC spawning
+function GetSharedCharacterData(characterId)
+    if not SharedCharacters or not SharedCharacters.pool then
+        return nil
+    end
+    return SharedCharacters.GetById(characterId)
+end
+
+-- Check if NPC can be spawned/interacted with (checks jail status for shared characters)
+function CanInteractWithNPC(npcId)
+    -- Check if this is a shared character that might be in jail
+    if not IsSharedCharacterAvailable(npcId) then
+        return false, "in_jail"
+    end
+    return true, nil
+end
 
 -----------------------------------------------------------
 -- NPC STATE LOCKING
@@ -429,11 +496,49 @@ end
 -- HELPER: Get NPC by ID
 -----------------------------------------------------------
 function GetNPCById(npcId)
+    -- First check Config.NPCs
     for _, npc in pairs(Config.NPCs) do
         if npc.id == npcId then
             return npc
         end
     end
+
+    -- Then check shared character pool
+    if SharedCharacters and SharedCharacters.pool then
+        local sharedChar = SharedCharacters.GetById(npcId)
+        if sharedChar then
+            -- Convert shared character format to NPC format expected by this script
+            return {
+                id = sharedChar.id,
+                name = sharedChar.firstname .. " " .. sharedChar.lastname,
+                model = sharedChar.model,
+                homeLocation = sharedChar.homeLocation,
+                movement = sharedChar.movement,
+                schedule = sharedChar.schedule,
+                role = sharedChar.role,
+                trustCategory = sharedChar.trustCategory,
+                voice = Config.Voices and Config.Voices[sharedChar.voiceStyle] or nil,
+                systemPrompt = sharedChar.systemPrompt,
+                intel = sharedChar.intel,
+                personality = {
+                    type = sharedChar.role,
+                    traits = sharedChar.personality,
+                    knowledge = table.concat(sharedChar.intelTypes or {}, ", "),
+                    greeting = "*looks at you* Yeah? What do you want?"
+                },
+                contextReactions = {
+                    copReaction = "extremely_suspicious",
+                    hasDrugs = "more_open",
+                    hasMoney = "greedy",
+                    hasCrimeTools = "respectful"
+                },
+                -- Mark as shared character for special handling
+                isSharedCharacter = true,
+                sharedData = sharedChar
+            }
+        end
+    end
+
     return nil
 end
 
@@ -547,6 +652,20 @@ RegisterNetEvent('ai-npcs:server:startConversation', function(npcId)
     local Player = QBCore.Functions.GetPlayer(src)
     if not Player then return end
 
+    -- Check if shared character is available (not in jail)
+    local canInteract, reason = CanInteractWithNPC(npcId)
+    if not canInteract then
+        if reason == "in_jail" then
+            TriggerClientEvent('ox_lib:notify', src, {
+                title = 'Unavailable',
+                description = 'This person is currently unavailable',
+                type = 'error'
+            })
+            print(("[AI NPCs] Player %s tried to talk to %s but they are in jail"):format(src, npcId))
+        end
+        return
+    end
+
     -- Check if NPC is already in conversation with someone else
     if IsNPCLockedByOther(npcId, src) then
         local owner = GetNPCLockOwner(npcId)
@@ -569,14 +688,8 @@ RegisterNetEvent('ai-npcs:server:startConversation', function(npcId)
         return
     end
 
-    -- Find NPC config
-    local npc = nil
-    for _, npcData in pairs(Config.NPCs) do
-        if npcData.id == npcId then
-            npc = npcData
-            break
-        end
-    end
+    -- Find NPC config (checks both Config.NPCs and SharedCharacters)
+    local npc = GetNPCById(npcId)
 
     if not npc then
         UnlockNPC(npcId, src)  -- Release lock if NPC not found

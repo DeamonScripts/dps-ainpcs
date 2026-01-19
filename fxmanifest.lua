@@ -8,6 +8,7 @@ version '2.5.0'
 
 shared_scripts {
     '@ox_lib/init.lua',
+    '@ac-pedinteraction/shared/characters.lua',  -- Shared character pool
     'config.lua',
     'quests.lua'
 }
@@ -46,7 +47,8 @@ dependencies {
     'ox_lib',
     'ox_target',
     'oxmysql',
-    'qb-core'
+    'qb-core',
+    'ac-pedinteraction'  -- Shared character pool and jail status
 }
 
 -- Exports for other resources
