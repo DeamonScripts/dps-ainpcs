@@ -27,7 +27,7 @@ CreateThread(function()
     if SharedCharacters and SharedCharacters.pool then
         print("^2[AI NPCs]^7 Shared character pool: LOADED (" .. #SharedCharacters.pool .. " characters)")
     else
-        print("^3[AI NPCs]^7 Shared character pool: NOT AVAILABLE (ac-pedinteraction not running?)")
+        print("^3[AI NPCs]^7 Shared character pool: NOT AVAILABLE (dps-badpeds not running?)")
     end
 end)
 
@@ -47,8 +47,8 @@ function IsSharedCharacterAvailable(characterId)
         return true  -- Not a shared character, assume available
     end
 
-    -- Use ac-pedinteraction's cached jail status check
-    local available = exports['ac-pedinteraction']:IsCharacterAvailable(char.firstname, char.lastname)
+    -- Use dps-badpeds's cached jail status check
+    local available = exports['dps-badpeds']:IsCharacterAvailable(char.firstname, char.lastname)
 
     if Config.Debug and Config.Debug.enabled and not available then
         print(("[AI NPCs] Character %s %s is currently in jail"):format(char.firstname, char.lastname))
@@ -57,7 +57,7 @@ function IsSharedCharacterAvailable(characterId)
     return available
 end
 
--- Listen for arrest events from ac-pedinteraction
+-- Listen for arrest events from dps-badpeds
 RegisterNetEvent('dps-ainpcs:characterArrested', function(firstname, lastname, jailHours)
     print(("[AI NPCs] ^3Character arrested: %s %s for %d hours^7"):format(firstname, lastname, jailHours or 0))
 
